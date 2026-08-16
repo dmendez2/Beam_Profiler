@@ -114,7 +114,7 @@ class ScatterPlot(QWidget):
 
         # Setting up axis labels
         self.plot.setLabel("bottom", "Displacement", units="In", **{"color": "#FFFFFF", "font-size": "16pt"})
-        self.plot.setLabel("left", "Voltage", units="V", **{"color": "#FFFFFF", "font-size": "16pt"})
+        self.plot.setLabel("left", "Current", units="A", **{"color": "#FFFFFF", "font-size": "16pt"})
 
         self.scatter = pg.ScatterPlotItem(size=10, brush="#2CFF05")
         self.plot.addItem(self.scatter)
@@ -297,30 +297,24 @@ class HP_34401A_Interface():
     def clear_message(self):
         self.write('DISP:TEXT:CLE') # --> Deletes the message from the front panel display
 
-    def configure_dc_voltage_measurements(self, isAutoRange = True, isAutoZero = True, isAutoImpedance = False, sampleCounts = 1, integrationTime = 10, voltageRange = None):
-        self.write('FUNC "VOLT:DC"')
-        self.write(f'VOLT:DC:NPLC {integrationTime}') # Changes Integration Time Options are 0.02, 0.2, 1, 10, 100
+    def configure_dc_current_measurements(self, isAutoRange = True, isAutoZero = True, sampleCounts = 1, integrationTime = 10, currentRange = None):
+        self.write('FUNC "CURR:DC"')
+        self.write(f'CURR:DC:NPLC {integrationTime}') # Changes Integration Time Options are 0.02, 0.2, 1, 10, 100
 
         if isAutoRange:
-            self.write('VOLT:DC:RANG:AUTO ON') # --> Let multimeter automatically determine range of voltage and resolution based on input
+            self.write('CURR:DC:RANG:AUTO ON') # --> Let multimeter automatically determine range of current and resolution based on input
         else:
-            if voltageRange is None or integrationTime is None:
-                print('Failure, voltage range or integration time not set')
+            if currentRange is None or integrationTime is None:
+                print('Failure, current range or integration time not set')
                 return
 
-            self.write(f'VOLT:DC:RANG {voltageRange}') # --> Range of voltage measurements expected
+            self.write(f'CURR:DC:RANG {currentRange}') # --> Range of current measurements expected
 
-        # Changes the Autozero functionality. Autozero removes internal voltage offsets due to temperature fluctuations. It measures an internal baseline 'zero' voltage and subtracts the offset from 0 to your measurements.
+        # Changes the Autozero functionality. Autozero removes internal current offsets due to temperature fluctuations. It measures an internal baseline 'zero' current and subtracts the offset from 0 to your measurements.
         if isAutoZero:
             self.write('SENS:ZERO:AUTO ON')
         else:
             self.write('SENS:ZERO:AUTO ON')
-
-        # Changes input resistance used to measure voltage (Auto OFF will always use 10 MEGA_OHM)
-        if isAutoImpedance:
-            self.write('INP:IMP:AUTO ON')
-        else:
-            self.write('INP:IMP:AUTO OFF')
 
         self.write(f'SAMP:COUN {sampleCounts}') # --> For reading multiple measurements per trigger (Can average)
         self.write('TRIG:SOUR IMM') # --> Trigger source comes internally from multimeter when measurement requested
@@ -328,7 +322,46 @@ class HP_34401A_Interface():
         return
 
     def take_measurement(self, samples_per_trigger):
-        read_msg = self.query('READ?').replace('\x00', '') # Takes measurement and sends results straight to computer through the GPIB Bus
+        self.write('*CLS') # Clear any old errors unrelated to the current measurement
+        self.write('*ESE 1') # Tell multimeter to flip bit 5 in the serial poll when all following commands are completed up to an '*OPC' command
+
+        # Ensure that the previous commands have been read to ensure that a bit will flip when all following commands are completed
+        status = self.query('*OPC?').replace('\x00', '')
+        if status != '1':
+            return None
+
+        self.write('INIT') # Takes measurement and asks multimeter to store it in its local memory
+        self.write('*OPC')
+
+        # Start a timer. If the time for a measurement takes too long we can abort
+        timeout_start = time.time()
+
+        # This loop checks if Bit 5 on the status poll has been flipped
+        while True:
+            # Tell the Prologix adapter to run an IEEE-488 serial poll on address 22
+            # (Replace '++spoll' with your specific adapter's poll command if different)
+            self.write(f'++spoll {self.gpib_address}')
+
+            # Read the single byte result back from the adapter
+            poll_reply = self.hp_34401a.readline().decode('ascii').strip()
+
+            if poll_reply.isdigit():
+                status_byte = int(poll_reply)
+
+                # Check if Bit 5 (decimal value 32) is flipped
+                if status_byte & 32:
+                    break  # Measurement finished so we exit the loop.
+
+            # Assume each measurement takes 1 second max so if the time exceeds the number of samples then we quit
+            if time.time() - timeout_start > samples_per_trigger:
+                print("Error: HPIB Serial Poll Timeout.")
+                return None
+
+            time.sleep(0.05) # Keep the serial line happy
+
+        # Measurements have been completed so read multimeter memory
+        read_msg = self.query('FETCH?').replace('\x00', '') # Sends results from multimeter memory to computer through the GPIB Bus
+
         if read_msg == '':
             return None
 
@@ -363,7 +396,7 @@ class Beam_Profiler_Interface(QObject):
 
         self.h5file = None
         self.displacements_dataset = None
-        self.voltages_dataset = None
+        self.current_dataset = None
         self.timestamp_dataset = None
 
         self.error_dialog = None
@@ -373,7 +406,7 @@ class Beam_Profiler_Interface(QObject):
         self.gpib_address = None
         self.baud_rate = None
 
-        self.voltage_range = None
+        self.current_range = None
         self.integration_time = None
         self.displacement_per_sample = None
 
@@ -386,7 +419,6 @@ class Beam_Profiler_Interface(QObject):
 
         self.is_auto_range = True
         self.is_auto_zero = True
-        self.is_auto_impedance = False
 
         self.samples_per_trigger = 1
 
@@ -444,11 +476,10 @@ class Beam_Profiler_Interface(QObject):
 
         # Set attributes relavent to current experiment
         ### Configured Multimeter Settings ###
-        self.h5file.attrs["voltage_measurement_range (V)"] = self.voltage_range
+        self.h5file.attrs["current_measurement_range (A)"] = self.current_range
         self.h5file.attrs["integration_time (PLCs)"] = self.integration_time
         self.h5file.attrs["is_auto_range"] = self.is_auto_range
         self.h5file.attrs["is_auto_zero"] = self.is_auto_zero
-        self.h5file.attrs["is_auto_impedance"] = self.is_auto_impedance
         self.h5file.attrs["samples_per_trigger"] = self.samples_per_trigger
         self.h5file.attrs["displacement_per_sample (In)"] = self.displacement_per_sample
 
@@ -465,19 +496,19 @@ class Beam_Profiler_Interface(QObject):
         self.h5file.attrs["local_timezone"] = datetime.now().astimezone().tzname()
 
         self.displacements_dataset = self.h5file.create_dataset("displacement (In)",shape=(0,),maxshape=(None,),dtype=np.float64, chunks=True)
-        self.voltages_dataset = self.h5file.create_dataset("voltage (V)",shape=(0,),maxshape=(None,),dtype=np.float64, chunks=True)
-        self.timestamp_dataset = self.h5file.create_dataset("voltage (V)",shape=(0,),maxshape=(None,),dtype=np.float64, chunks=True)
+        self.current_dataset = self.h5file.create_dataset("current (A)",shape=(0,),maxshape=(None,),dtype=np.float64, chunks=True)
+        self.timestamp_dataset = self.h5file.create_dataset("timestampe (s)",shape=(0,),maxshape=(None,),dtype=np.float64, chunks=True)
         return True
 
-    def write_measurement(self, measurement_id, displacement, voltage):
+    def write_measurement(self, measurement_id, displacement, current):
         i = measurement_id
 
         self.displacements_dataset.resize((i+1,))
-        self.voltages_dataset.resize((i+1,))
+        self.current_dataset.resize((i+1,))
         self.timestamp_dataset.resize((i+1,))
 
         self.displacements_dataset[i] = displacement
-        self.voltages_dataset[i] = voltage
+        self.current_dataset[i] = current
 
         if measurement_id == 0:
             self.start_time = time.perf_counter()
@@ -488,9 +519,9 @@ class Beam_Profiler_Interface(QObject):
         self.h5file.flush()
         return
 
-    def edit_written_measurement(self, measurement_id, displacement, voltage):
+    def edit_written_measurement(self, measurement_id, displacement, current):
         self.displacements_dataset[measurement_id] = displacement
-        self.voltages_dataset[measurement_id] = voltage
+        self.current_dataset[measurement_id] = current
 
         if measurement_id == 0 and self.max_measurement_id == 1:
             self.start_time = time.perf_counter()
@@ -524,7 +555,7 @@ class Beam_Profiler_Interface(QObject):
             self.h5file.close()
             self.h5file = None
             self.displacements_dataset = None
-            self.voltages_dataset = None
+            self.current_dataset = None
             self.timestamp_dataset = None
             return
 
@@ -608,11 +639,11 @@ class Beam_Profiler_Interface(QObject):
         return
 
     @Slot(str)
-    def updateVoltageRange(self, voltage_range):
-        print("Voltage Range: ", voltage_range)
-        self.voltage_range = voltage_range
+    def updateCurrentRange(self, current_range):
+        print("Current Range: ", current_range)
+        self.current_range = current_range
 
-        if voltage_range == 'AUTO':
+        if current_range == 'AUTO':
             self.is_auto_range = True
 
         return
@@ -632,15 +663,6 @@ class Beam_Profiler_Interface(QObject):
             self.is_auto_zero = False
         return
 
-    @Slot(str)
-    def updateAutoImpedance(self, auto_impedance_status):
-        print("Auto-Impedance Status: ", auto_impedance_status)
-        if auto_impedance_status == 'On':
-            self.is_auto_impedance = True
-        elif auto_impedance_status == 'Off':
-            self.is_auto_impedance = False
-        return
-
     @Slot(int)
     def updateSamplesPerTrigger(self, samples_per_trigger):
         print("Samples Per Trigger: ", samples_per_trigger)
@@ -656,7 +678,7 @@ class Beam_Profiler_Interface(QObject):
     @Slot(str)
     def beginMeasurement(self, qt_file_path):
 
-        self.multimeter.configure_dc_voltage_measurements(self.is_auto_range, self.is_auto_zero, self.is_auto_impedance, self.samples_per_trigger, self.integration_time, self.voltage_range)
+        self.multimeter.configure_dc_current_measurements(self.is_auto_range, self.is_auto_zero, self.samples_per_trigger, self.integration_time, self.current_range)
         error_status = self.multimeter.check_for_errors()
 
         if error_status == '+0,"No error"':
@@ -686,13 +708,13 @@ class Beam_Profiler_Interface(QObject):
 
     @Slot()
     def measurementTriggered(self):
-        voltage = self.multimeter.take_measurement(self.samples_per_trigger)
+        current = self.multimeter.take_measurement(self.samples_per_trigger)
         error_status = self.multimeter.check_for_errors()
 
-        if error_status == '+0,"No error"' and voltage is not None:
+        if error_status == '+0,"No error"' and current is not None:
             if self.current_measurement_id == self.max_measurement_id:
-                self.write_measurement(self.current_measurement_id, self.current_displacement, voltage)
-                self.measurementCompleted.emit(self.current_measurement_id, self.current_displacement, voltage)
+                self.write_measurement(self.current_measurement_id, self.current_displacement, current)
+                self.measurementCompleted.emit(self.current_measurement_id, self.current_displacement, current)
 
                 self.current_measurement_id += 1
                 self.max_measurement_id += 1
@@ -700,8 +722,8 @@ class Beam_Profiler_Interface(QObject):
                 self.current_displacement += self.displacement_per_sample
                 self.max_displacement += self.displacement_per_sample
             else:
-                self.edit_written_measurement(self.current_measurement_id, self.current_displacement, voltage)
-                self.measurementEdited.emit(self.current_measurement_id, self.current_displacement, voltage)
+                self.edit_written_measurement(self.current_measurement_id, self.current_displacement, current)
+                self.measurementEdited.emit(self.current_measurement_id, self.current_displacement, current)
 
                 self.current_measurement_id = self.max_measurement_id
                 self.current_displacement = self.max_displacement
@@ -712,7 +734,7 @@ class Beam_Profiler_Interface(QObject):
             self.currentDisplacementChanged.emit()
 
             self.multimeter.beep()
-        elif voltage is None:
+        elif current is None:
             self.multimeter.clear_event_register()
             self.error_dialog = ErrorDialog("Measurement Error", "No Reading Returned from Multimeter")
             self.error_dialog.show()

@@ -211,7 +211,7 @@ ApplicationWindow {
                     }
 
                     SectionLabel{
-                        text: "RANGE (V):"
+                        text: "RANGE (A):"
                         enabled: bp_controller.canConfigureSettings
                         displayScaleFactor: root.displayScaleFactor
                     }
@@ -221,11 +221,11 @@ ApplicationWindow {
                         enabled: bp_controller.canConfigureSettings
                         displayScaleFactor: root.displayScaleFactor
                         Layout.fillWidth: true
-                        model: ["Auto", "0.1", "1", "10", "100", "1000"]
+                        model: ["Auto", "0.01", "0.1", "1", "3"]
                         currentIndex: 0
 
                         onCurrentTextChanged: {
-                            bp_controller.updateVoltageRange(currentText)
+                            bp_controller.updateCurrentRange(currentText)
                         }
                     }
 
@@ -264,25 +264,6 @@ ApplicationWindow {
 
                         onCurrentTextChanged: {
                             bp_controller.updateAutoZero(currentText)
-                        }
-                    }
-
-                    SectionLabel{
-                        text: "AUTO-IMPEDANCE:"
-                        enabled: bp_controller.canConfigureSettings
-                        displayScaleFactor: root.displayScaleFactor
-                    }
-
-                    StyledComboBox{
-                        id: autoInputResistanceComboBox
-                        enabled: bp_controller.canConfigureSettings
-                        displayScaleFactor: root.displayScaleFactor
-                        Layout.fillWidth: true
-                        model: ["On", "Off"]
-                        currentIndex: 1
-
-                        onCurrentTextChanged: {
-                            bp_controller.updateAutoImpedance(currentText)
                         }
                     }
 
